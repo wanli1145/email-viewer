@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "runoutlook": "PORT=1111 node server.js",
     "check": "node --check server.js"
   },
   "engines": {

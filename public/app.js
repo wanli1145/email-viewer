@@ -1,4 +1,5 @@
 const app = document.querySelector("#app");
+const APP_VERSION = "v1.0";
 
 const state = {
   accounts: [],
@@ -121,6 +122,7 @@ function render() {
           <div>
             <h1>邮箱聚合平台</h1>
           </div>
+          <span class="version-badge">${APP_VERSION}</span>
         </div>
         <button id="toggle-actions" class="icon-button primary" aria-label="${state.actionsExpanded ? "收起账号操作" : "展开账号操作"}" title="${state.actionsExpanded ? "收起账号操作" : "展开账号操作"}" aria-expanded="${state.actionsExpanded ? "true" : "false"}">
           ${icon("settings")}
@@ -420,7 +422,7 @@ function renderLinks(links) {
   if (!links.length) return "";
   return html`
     <div class="link-list">
-      <div class="message-kicker">邮件链接</div>
+      <div class="message-kicker">精选链接</div>
       <div class="link-actions">
         ${links.map(renderMailLink).join("")}
       </div>
@@ -667,6 +669,8 @@ async function markRead(uids) {
     });
     state.unreadCount = data.unreadCount ?? null;
     state.fetchedAt = data.account?.fetchedAt || new Date().toISOString();
+    const marked = new Set(ids);
+    state.messages = state.messages.filter((message) => !marked.has(String(message.uid || "")));
     const currentRefresh = accountRefreshState(account.id);
     state.refreshStateByAccount[account.id] = {
       ...currentRefresh,
@@ -678,6 +682,15 @@ async function markRead(uids) {
     };
     toast(`已标记 ${data.markedCount || ids.length} 封邮件为已读。`);
   } catch (error) {
+    state.messages = [
+      {
+        from: "Error",
+        date: new Date().toISOString(),
+        subject: "标为已读失败",
+        body: error.message,
+      },
+      ...state.messages,
+    ];
     toast(`标为已读失败：${error.message}`);
   } finally {
     state.markReadBusy = false;

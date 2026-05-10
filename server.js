@@ -330,11 +330,11 @@ function decodeMimeHeader(value = "") {
 }
 
 function unfoldHeaders(raw) {
-  return raw.replace(/\r?\n[ \t]+/g, " ");
+  return String(raw || "").replace(/\r?\n[ \t]+/g, " ");
 }
 
 function parseHeaders(rawMessage) {
-  const [headerText = ""] = rawMessage.split(/\r?\n\r?\n/, 1);
+  const [headerText = ""] = String(rawMessage || "").split(/\r?\n\r?\n/, 1);
   const headers = new Map();
   for (const line of unfoldHeaders(headerText).split(/\r?\n/)) {
     const divider = line.indexOf(":");
@@ -346,16 +346,17 @@ function parseHeaders(rawMessage) {
 }
 
 function splitHeaderBody(rawMessage) {
-  const match = rawMessage.match(/\r?\n\r?\n/);
-  if (!match || typeof match.index !== "number") return { headerText: rawMessage, body: "" };
+  const message = String(rawMessage || "");
+  const match = message.match(/\r?\n\r?\n/);
+  if (!match || typeof match.index !== "number") return { headerText: message, body: "" };
   return {
-    headerText: rawMessage.slice(0, match.index),
-    body: rawMessage.slice(match.index + match[0].length),
+    headerText: message.slice(0, match.index),
+    body: message.slice(match.index + match[0].length),
   };
 }
 
 function parseContentType(value = "") {
-  const [type = "text/plain", ...params] = value.split(";");
+  const [type = "text/plain", ...params] = String(value || "text/plain").split(";");
   const parsed = {
     type: type.trim().toLowerCase(),
     params: new Map(),
@@ -371,7 +372,7 @@ function parseContentType(value = "") {
 }
 
 function decodeQuotedPrintableBuffer(value) {
-  const clean = value.replace(/=\r?\n/g, "");
+  const clean = String(value || "").replace(/=\r?\n/g, "");
   const bytes = [];
   for (let index = 0; index < clean.length; index += 1) {
     if (clean[index] === "=" && /^[0-9A-Fa-f]{2}$/.test(clean.slice(index + 1, index + 3))) {
@@ -391,11 +392,11 @@ function decodeTransfer(body, headers) {
   let buffer;
 
   if (transfer === "base64") {
-    buffer = Buffer.from(body.replace(/\s/g, ""), "base64");
+    buffer = Buffer.from(String(body || "").replace(/\s/g, ""), "base64");
   } else if (transfer === "quoted-printable") {
     buffer = decodeQuotedPrintableBuffer(body);
   } else {
-    buffer = Buffer.from(body, "utf8");
+    buffer = Buffer.from(String(body || ""), "utf8");
   }
 
   if (charset.includes("utf")) return buffer.toString("utf8");
@@ -405,7 +406,7 @@ function decodeTransfer(body, headers) {
 
 function splitMultipart(body, boundary) {
   const marker = `--${boundary}`;
-  return body
+  return String(body || "")
     .split(marker)
     .slice(1)
     .map((part) => part.replace(/^\r?\n/, "").replace(/\r?\n--\s*$/, ""))
@@ -459,33 +460,90 @@ function extractLinks(rawMessage) {
 
 function linksFromHtml(html) {
   const links = [];
-  for (const match of html.matchAll(/<a\b[^>]*href\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi)) {
+  for (const match of String(html || "").matchAll(/<a\b[^>]*href\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi)) {
     const href = decodeHtmlEntities(match[2].trim());
     if (!isSafeLink(href)) continue;
     const label = normalizeMailText(htmlToText(match[3])).slice(0, 120) || href;
     links.push({ href, label });
   }
-  return uniqueLinks([...links, ...linksFromText(htmlToText(html))]);
+  return rankLinks([...links, ...linksFromText(htmlToText(html))]);
 }
 
 function linksFromText(text) {
   const links = [];
-  for (const match of text.matchAll(/\bhttps?:\/\/[^\s<>"')]+/gi)) {
+  for (const match of String(text || "").matchAll(/\bhttps?:\/\/[^\s<>"')]+/gi)) {
     const href = match[0].replace(/[.,;:!?]+$/g, "");
     if (isSafeLink(href)) links.push({ href, label: href });
   }
-  return uniqueLinks(links);
+  return rankLinks(links);
 }
 
 function uniqueLinks(links) {
   const seen = new Set();
   const result = [];
   for (const link of links) {
-    if (!link.href || seen.has(link.href)) continue;
-    seen.add(link.href);
-    result.push(link);
+    const normalized = normalizeLink(link.href);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push({ ...link, href: normalized });
   }
-  return result.slice(0, 20);
+  return result;
+}
+
+function rankLinks(links) {
+  return uniqueLinks(links)
+    .map((link) => ({ ...link, score: linkScore(link) }))
+    .filter((link) => link.score >= 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 6)
+    .map(({ score: _score, ...link }) => link);
+}
+
+function normalizeLink(href) {
+  try {
+    const url = new URL(String(href || ""));
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    url.hash = "";
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(utm_|ref_|tag$|ascsubtag$|pf_rd_|pd_rd_|qid$|sr$|sprefix$)/i.test(key)) {
+        url.searchParams.delete(key);
+      }
+    }
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function linkScore(link) {
+  const href = String(link.href || "");
+  const label = normalizeMailText(link.label || "");
+  const combined = `${label} ${href}`.toLowerCase();
+  let score = 10;
+
+  if (/\b(sign in|log in|login|verify|confirm|continue|finish|access|magic|reset|code|activate|approve)\b/i.test(combined)) {
+    score += 80;
+  }
+  if (label && label !== href && label.length <= 80) score += 15;
+  if (/amazon\.com/i.test(href) && /\b(nav_|node=|b\?|gp\/|fashion|home-garden|fmc|deal|new-arrivals)\b/i.test(href)) {
+    score -= 45;
+  }
+  if (/^(www\.)?amazon\.com$/i.test(safeHost(href)) && !/\b(sign|verify|confirm|account|ap\/|gp\/css|your-account)\b/i.test(combined)) {
+    score -= 35;
+  }
+  if (!label || label === href || /^https?:\/\//i.test(label)) score -= 10;
+  if (/\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(href)) score -= 100;
+  if (/unsubscribe|privacy|terms|preferences|view in browser|manage email/i.test(combined)) score -= 20;
+
+  return score;
+}
+
+function safeHost(href) {
+  try {
+    return new URL(href).host;
+  } catch {
+    return "";
+  }
 }
 
 function isSafeLink(href) {
@@ -580,7 +638,7 @@ function decodeHtmlEntities(value) {
 
 function htmlToText(html) {
   return normalizeMailText(
-    html
+    String(html || "")
       .replace(/<style[\s\S]*?<\/style>/gi, " ")
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
       .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
@@ -600,7 +658,7 @@ function htmlToText(html) {
 }
 
 function normalizeMailText(text) {
-  return text
+  return String(text || "")
     .replace(/\r/g, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n[ \t]+/g, "\n")
@@ -772,6 +830,7 @@ class ImapClient {
   async selectMailbox(mailbox = "INBOX") {
     const response = await this.command(`SELECT ${quoteMailbox(mailbox)}`);
     if (!/\r\nA\d+ OK/i.test(response)) throw new Error(`无法选择文件夹 ${mailbox}：${lastLine(response)}`);
+    this.readOnly = /\[READ-ONLY\]/i.test(response);
   }
 
   async listMailboxes() {
@@ -825,19 +884,27 @@ class ImapClient {
     const response = await this.command(`UID FETCH ${uid} (UID INTERNALDATE BODY.PEEK[])`);
     if (!/\r\nA\d+ OK/i.test(response)) throw new Error(`抓取邮件失败：${lastLine(response)}`);
     const internalDate = response.match(/INTERNALDATE "([^"]+)"/i)?.[1] || "";
-    const match = response.match(/\{\d+\}\r\n([\s\S]*?)\r\n\)\r\nA\d+ OK/i);
+    const raw = extractImapLiteral(response);
     return {
       uid,
       internalDate,
-      raw: match ? match[2] : response,
+      raw,
     };
   }
 
   async markSeen(uids) {
     const ids = sanitizeUids(uids);
     if (!ids.length) return 0;
-    const response = await this.command(`UID STORE ${ids.join(",")} +FLAGS.SILENT (\\Seen)`);
-    if (!/\r\nA\d+ OK/i.test(response)) throw new Error(`标为已读失败：${lastLine(response)}`);
+    if (this.readOnly) {
+      throw new Error("当前文件夹以只读模式打开，不能标为已读。");
+    }
+    let response = await this.command(`UID STORE ${ids.join(",")} +FLAGS.SILENT (\\Seen)`);
+    if (!/\r\nA\d+ OK/i.test(response)) {
+      response = await this.command(`UID STORE ${ids.join(",")} +FLAGS (\\Seen)`);
+    }
+    if (!/\r\nA\d+ OK/i.test(response)) {
+      throw new Error(`IMAP STORE 失败：${lastLine(response)}`);
+    }
     return ids.length;
   }
 
@@ -860,6 +927,30 @@ class ImapClient {
 
 function lastLine(response) {
   return response.trim().split(/\r?\n/).at(-1) || response.trim();
+}
+
+function extractImapLiteral(response) {
+  const match = response.match(/\{(\d+)\}\r\n/);
+  if (!match || typeof match.index !== "number") return response;
+  const byteLength = Number(match[1]);
+  const start = match.index + match[0].length;
+  if (!Number.isFinite(byteLength) || byteLength < 0) return response.slice(start);
+
+  let bytes = 0;
+  let end = start;
+  while (end < response.length && bytes < byteLength) {
+    const code = response.charCodeAt(end);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4;
+      end += 1;
+    } else {
+      bytes += 3;
+    }
+    end += 1;
+  }
+  return response.slice(start, end);
 }
 
 function decodeBase64Challenge(value) {
@@ -995,7 +1086,19 @@ async function refreshAndFetch(clientId, refreshToken, email, folder = "INBOX") 
     const ids = await client.latestUids(3);
     const messages = [];
     for (const id of ids) {
-      messages.push(summarizeMessage(await client.fetchMessage(id)));
+      try {
+        messages.push(summarizeMessage(await client.fetchMessage(id)));
+      } catch (error) {
+        messages.push({
+          uid: id,
+          receivedAt: "",
+          from: "Error",
+          date: nowIso(),
+          subject: "邮件解析失败",
+          body: error.message,
+          links: [],
+        });
+      }
     }
     return { unreadCount, messages };
   });
@@ -1229,6 +1332,7 @@ const server = createServer(async (req, res) => {
     }
     await serveStatic(req, res, url);
   } catch (error) {
+    console.error(error.stack || error.message || error);
     jsonResponse(res, 500, { error: error.message || "服务器内部错误。" });
   }
 });
