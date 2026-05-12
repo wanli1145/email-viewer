@@ -1,0 +1,40 @@
+#!/usr/bin/env sh
+SOURCE="$0"
+
+while [ -L "$SOURCE" ]; do
+  DIR="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  case "$TARGET" in
+    /*) SOURCE="$TARGET" ;;
+    *) SOURCE="$DIR/$TARGET" ;;
+  esac
+done
+
+APP_DIR="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)"
+cd "$APP_DIR" || exit 1
+
+DEFAULT_PORT="${PORT:-1111}"
+MAX_PORT="${RUNOUTLOOK_MAX_PORT:-1125}"
+
+is_port_free() {
+  ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+PORT_TO_USE="$DEFAULT_PORT"
+while [ "$PORT_TO_USE" -le "$MAX_PORT" ]; do
+  if is_port_free "$PORT_TO_USE"; then
+    break
+  fi
+  PORT_TO_USE=$((PORT_TO_USE + 1))
+done
+
+if [ "$PORT_TO_USE" -gt "$MAX_PORT" ]; then
+  echo "No free port found between $DEFAULT_PORT and $MAX_PORT." >&2
+  exit 1
+fi
+
+if [ "$PORT_TO_USE" != "$DEFAULT_PORT" ]; then
+  echo "Port $DEFAULT_PORT is busy, using $PORT_TO_USE instead." >&2
+fi
+
+PORT="$PORT_TO_USE" exec node server.js

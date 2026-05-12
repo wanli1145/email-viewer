@@ -1,5 +1,5 @@
 const app = document.querySelector("#app");
-const APP_VERSION = "v1.0";
+const APP_VERSION = "v1.1";
 
 const state = {
   accounts: [],
@@ -19,6 +19,8 @@ const state = {
   markReadBusy: false,
   tokenBusy: false,
   tokenStatus: null,
+  accountSort: "email",
+  sidebarScrollTop: 0,
   toast: "",
 };
 
@@ -72,6 +74,43 @@ function formatDate(value) {
   }).format(new Date(value));
 }
 
+function preserveSidebarScroll(task) {
+  const sidebar = document.querySelector(".sidebar");
+  const scrollTop = sidebar?.scrollTop ?? state.sidebarScrollTop;
+  state.sidebarScrollTop = scrollTop;
+  task();
+  restoreSidebarScroll();
+}
+
+function restoreSidebarScroll() {
+  const sidebar = document.querySelector(".sidebar");
+  if (!sidebar) return;
+  sidebar.scrollTop = state.sidebarScrollTop;
+  window.requestAnimationFrame(() => {
+    const nextSidebar = document.querySelector(".sidebar");
+    if (nextSidebar) nextSidebar.scrollTop = state.sidebarScrollTop;
+  });
+}
+
+async function copyText(text, successMessage) {
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    copied = true;
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    copied = document.execCommand("copy");
+    textarea.remove();
+  }
+  toast(copied ? successMessage : `复制失败，请手动复制：${text}`);
+}
+
 function toast(message) {
   state.toast = message;
   render();
@@ -84,6 +123,17 @@ function toast(message) {
 
 function selectedAccount() {
   return state.accounts.find((account) => account.id === state.selectedId) || null;
+}
+
+function sortedAccounts() {
+  const accounts = [...state.accounts];
+  if (state.accountSort === "imported") {
+    return accounts.sort((a, b) => {
+      const importedDiff = new Date(b.importedAt || b.updatedAt || 0) - new Date(a.importedAt || a.updatedAt || 0);
+      return importedDiff || a.email.localeCompare(b.email, "en", { sensitivity: "base" });
+    });
+  }
+  return accounts.sort((a, b) => a.email.localeCompare(b.email, "en", { sensitivity: "base" }));
 }
 
 function selectedFolder(id = state.selectedId) {
@@ -108,7 +158,10 @@ async function boot() {
 }
 
 function render() {
+  const sidebar = document.querySelector(".sidebar");
+  if (sidebar) state.sidebarScrollTop = sidebar.scrollTop;
   const account = selectedAccount();
+  const accounts = sortedAccounts();
   app.innerHTML = html`
     <div class="app-shell ${state.sidebarCollapsed ? "sidebar-collapsed" : ""}">
       <header class="topbar">
@@ -140,9 +193,16 @@ function render() {
               ${icon(state.sidebarCollapsed ? "panel-open" : "panel-close")}
             </button>
           </div>
+          <div class="account-sort">
+            <label for="account-sort">排序</label>
+            <select id="account-sort">
+              <option value="email" ${state.accountSort === "email" ? "selected" : ""}>按字母</option>
+              <option value="imported" ${state.accountSort === "imported" ? "selected" : ""}>按导入时间</option>
+            </select>
+          </div>
           <div class="account-list">
-            ${state.accounts.length
-              ? state.accounts.map(renderAccountRow).join("")
+            ${accounts.length
+              ? accounts.map(renderAccountRow).join("")
               : `<div class="empty compact">暂无账号。展开账号操作后添加账号。</div>`}
           </div>
         </aside>
@@ -156,22 +216,25 @@ function render() {
     </div>
   `;
   bindEvents();
+  restoreSidebarScroll();
 }
 
-function renderAccountRow(account) {
+function renderAccountRow(account, index) {
   const refresh = accountRefreshState(account.id);
   return html`
-    <button class="account-row ${account.id === state.selectedId ? "active" : ""}" data-select="${account.id}">
-      <div>
+    <div class="account-row ${account.id === state.selectedId ? "active" : ""}" data-select="${account.id}" role="button" tabindex="0">
+      <span class="account-index">${String(index + 1).padStart(2, "0")}</span>
+      <div class="account-row-body">
         <div class="account-email">${escapeHtml(account.email)}</div>
         <div class="account-meta">
           <span class="badge">client_id ${escapeHtml(account.clientId.slice(0, 8))}...</span>
+          <span class="badge">导入 ${formatDate(account.importedAt || account.updatedAt)}</span>
           <span class="badge">更新 ${formatDate(account.updatedAt)}</span>
           ${renderAccountStatusBadges(refresh)}
         </div>
         ${renderAccountSummary(refresh)}
       </div>
-    </button>
+    </div>
   `;
 }
 
@@ -292,7 +355,9 @@ function renderMailPanel(account) {
     <section class="panel stack">
       <div class="section-title">
         <div>
-          <h2>${escapeHtml(account.email)}</h2>
+          <button class="selected-email-copy" data-copy-email="${escapeHtml(account.email)}" title="点击复制邮箱">
+            ${escapeHtml(account.email)}
+          </button>
           <p class="muted tiny">
             文件夹：${escapeHtml(folder)} · 未读：${Number.isFinite(state.unreadCount) ? state.unreadCount : "暂无"} · 最后读取：${formatDate(state.fetchedAt)}
           </p>
@@ -468,15 +533,37 @@ function bindEvents() {
     render();
   });
   document.querySelector("#import-csv")?.addEventListener("click", importCsv);
+  document.querySelector(".sidebar")?.addEventListener("scroll", (event) => {
+    state.sidebarScrollTop = event.currentTarget.scrollTop;
+  });
+  document.querySelector("#account-sort")?.addEventListener("change", (event) => {
+    state.accountSort = event.target.value;
+    state.sidebarScrollTop = 0;
+    render();
+  });
   document.querySelectorAll("[data-select]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.selectedId = button.dataset.select;
-      const refresh = accountRefreshState(button.dataset.select);
-      state.messages = refresh.status === "ok" ? refresh.messages || [] : [];
-      state.fetchedAt = refresh.fetchedAt || "";
-      state.unreadCount = refresh.unreadCount ?? null;
-      render();
+    const selectAccount = () => {
+      preserveSidebarScroll(() => {
+        state.selectedId = button.dataset.select;
+        const refresh = accountRefreshState(button.dataset.select);
+        state.messages = refresh.status === "ok" ? refresh.messages || [] : [];
+        state.fetchedAt = refresh.fetchedAt || "";
+        state.unreadCount = refresh.unreadCount ?? null;
+        render();
+      });
       loadFolders(button.dataset.select, false);
+    };
+    button.addEventListener("click", selectAccount);
+    button.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      selectAccount();
+    });
+  });
+  document.querySelectorAll("[data-copy-email]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      copyText(button.dataset.copyEmail, `已复制邮箱：${button.dataset.copyEmail}`);
     });
   });
   document.querySelectorAll("[data-fetch]").forEach((button) => {
@@ -602,12 +689,12 @@ async function loadFolders(id, foreground = false) {
       state.selectedFolderByAccount[id] = inbox?.name || state.foldersByAccount[id][0]?.name || "INBOX";
     }
   } catch (error) {
-    toast(`文件夹加载失败：${error.message}`);
+    if (foreground) toast(`文件夹加载失败：${error.message}`);
     state.foldersByAccount[id] = state.foldersByAccount[id] || [{ name: "INBOX", label: "Inbox / 收件箱" }];
     state.selectedFolderByAccount[id] = state.selectedFolderByAccount[id] || "INBOX";
   } finally {
     state.folderBusy = false;
-    render();
+    preserveSidebarScroll(() => render());
   }
 }
 

@@ -1,6 +1,6 @@
 # Outlook OAuth2 IMAP 内部测试工具
 
-当前版本：v1.0
+当前版本：v1.1
 
 本项目是一个本地 Web 端测试工具，用于读取管理员预置的 Outlook OAuth2 凭证。
 
@@ -9,7 +9,7 @@
 ## 启动
 
 ```bash
-npm run runoutlook
+runoutlook
 ```
 
 默认地址：
@@ -18,11 +18,7 @@ npm run runoutlook
 http://127.0.0.1:1111
 ```
 
-如果 1111 被占用：
-
-```bash
-PORT=3001 npm start
-```
+如果 1111 被占用，`runoutlook` 会自动尝试 1112、1113，直到 1125，并在终端输出实际地址。
 
 ## CSV 格式
 

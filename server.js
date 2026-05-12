@@ -23,6 +23,7 @@ const TOKEN_TIMEOUT_MS = Number(process.env.MS_TOKEN_TIMEOUT_MS || 20_000);
 const IMAP_CONNECT_TIMEOUT_MS = Number(process.env.MS_IMAP_CONNECT_TIMEOUT_MS || 15_000);
 const IMAP_COMMAND_TIMEOUT_MS = Number(process.env.MS_IMAP_COMMAND_TIMEOUT_MS || 25_000);
 const FETCH_TIMEOUT_MS = Number(process.env.MS_FETCH_TIMEOUT_MS || 60_000);
+const IMAP_CONNECT_RETRIES = Number(process.env.MS_IMAP_CONNECT_RETRIES || 3);
 const TOKEN_KEEPALIVE_INTERVAL_MS = Number(process.env.MS_TOKEN_KEEPALIVE_INTERVAL_MS || 6 * 60 * 60 * 1000);
 const TOKEN_KEEPALIVE_START_DELAY_MS = Number(process.env.MS_TOKEN_KEEPALIVE_START_DELAY_MS || 30_000);
 
@@ -40,9 +41,16 @@ db.exec(`
     email TEXT PRIMARY KEY,
     client_id TEXT NOT NULL,
     refresh_token TEXT NOT NULL,
+    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )
 `);
+
+const credentialColumns = db.prepare("PRAGMA table_info(credentials)").all();
+if (!credentialColumns.some((column) => column.name === "imported_at")) {
+  db.exec("ALTER TABLE credentials ADD COLUMN imported_at TEXT");
+  db.exec("UPDATE credentials SET imported_at = COALESCE(updated_at, CURRENT_TIMESTAMP) WHERE imported_at IS NULL");
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -187,7 +195,7 @@ function listAccounts() {
   const rows = db
     .prepare(
       `
-      SELECT email, client_id AS clientId, updated_at AS updatedAt
+      SELECT email, client_id AS clientId, imported_at AS importedAt, updated_at AS updatedAt
       FROM credentials
       ORDER BY email COLLATE NOCASE
       `,
@@ -197,6 +205,7 @@ function listAccounts() {
     id: accountId(row.email),
     email: row.email,
     clientId: row.clientId,
+    importedAt: row.importedAt,
     updatedAt: row.updatedAt,
   }));
 }
@@ -210,6 +219,14 @@ function findCredential(id) {
   return row;
 }
 
+function findCredentialByEmail(email) {
+  const row = db
+    .prepare("SELECT email, client_id AS clientId, refresh_token AS refreshToken FROM credentials WHERE email = ?")
+    .get(email);
+  if (!row) throw new Error("未找到该账号。");
+  return row;
+}
+
 function listCredentialsWithTokens() {
   return db
     .prepare("SELECT email, client_id AS clientId, refresh_token AS refreshToken FROM credentials ORDER BY email COLLATE NOCASE")
@@ -219,8 +236,8 @@ function listCredentialsWithTokens() {
 function importRows(rows) {
   const statement = db.prepare(
     `
-    INSERT INTO credentials (email, client_id, refresh_token, updated_at)
-    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    INSERT INTO credentials (email, client_id, refresh_token, imported_at, updated_at)
+    VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ON CONFLICT(email) DO UPDATE SET
       client_id = excluded.client_id,
       refresh_token = excluded.refresh_token,
@@ -235,15 +252,43 @@ function importRows(rows) {
   return count;
 }
 
-function saveRotatedRefreshToken(email, refreshToken) {
-  if (!refreshToken) return;
-  db.prepare(
+function saveRotatedRefreshToken(email, previousRefreshToken, nextRefreshToken) {
+  if (!nextRefreshToken || nextRefreshToken === previousRefreshToken) return false;
+  const result = db.prepare(
     `
     UPDATE credentials
     SET refresh_token = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE email = ?
+    WHERE email = ? AND refresh_token = ?
     `,
-  ).run(refreshToken, email);
+  ).run(nextRefreshToken, email, previousRefreshToken);
+  return Boolean(result.changes);
+}
+
+const tokenRefreshLocks = new Map();
+
+function withTokenRefreshLock(email, task) {
+  const key = email.trim().toLowerCase();
+  const previous = tokenRefreshLocks.get(key) || Promise.resolve();
+  const current = previous
+    .catch(() => {})
+    .then(task)
+    .finally(() => {
+      if (tokenRefreshLocks.get(key) === current) tokenRefreshLocks.delete(key);
+    });
+  tokenRefreshLocks.set(key, current);
+  return current;
+}
+
+async function refreshCredentialAccessToken(email) {
+  return withTokenRefreshLock(email, async () => {
+    const credential = findCredentialByEmail(email);
+    const token = await refreshAccessToken(credential.clientId, credential.refreshToken);
+    const rotated = saveRotatedRefreshToken(credential.email, credential.refreshToken, token.refreshToken);
+    return {
+      accessToken: token.accessToken,
+      rotated,
+    };
+  });
 }
 
 async function refreshAccessToken(clientId, refreshToken) {
@@ -309,6 +354,25 @@ async function refreshAccessTokenOnce(clientId, refreshToken, attempt) {
 
 function isRetryableNetworkError(error) {
   return /网络请求失败|超时|fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(error.message);
+}
+
+function isRetryableImapConnectError(error) {
+  return /Client network socket disconnected|IMAP 连接已关闭|服务器问候超时|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(error?.message || "");
+}
+
+function normalizeImapConnectError(error) {
+  const message = error?.message || "未知 IMAP 连接错误";
+  if (/Client network socket disconnected/i.test(message)) {
+    return new Error(
+      `连接 Outlook IMAP 失败：TLS 握手前网络连接被断开。已重试 ${IMAP_CONNECT_RETRIES} 次。请检查代理/VPN、防火墙、网络稳定性，或稍后再试。原始错误：${message}`,
+    );
+  }
+  if (/服务器问候超时|ETIMEDOUT/i.test(message)) {
+    return new Error(
+      `连接 Outlook IMAP 超时。已重试 ${IMAP_CONNECT_RETRIES} 次。请检查网络是否能访问 ${IMAP_HOST}:${IMAP_PORT}。原始错误：${message}`,
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
 }
 
 function delay(ms) {
@@ -692,10 +756,32 @@ class ImapClient {
     this.closed = false;
   }
 
-  connect() {
+  async connect() {
+    let lastError = null;
+    for (let attempt = 1; attempt <= IMAP_CONNECT_RETRIES; attempt += 1) {
+      try {
+        await this.connectOnce(attempt);
+        return;
+      } catch (error) {
+        lastError = error;
+        this.socket?.destroy();
+        this.socket = null;
+        this.buffer = "";
+        this.pending = [];
+        if (attempt < IMAP_CONNECT_RETRIES && isRetryableImapConnectError(error)) {
+          await delay(700 * attempt);
+          continue;
+        }
+        break;
+      }
+    }
+    throw normalizeImapConnectError(lastError);
+  }
+
+  connectOnce(attempt) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.fail(new Error(`等待 IMAP 服务器问候超时（${IMAP_CONNECT_TIMEOUT_MS / 1000} 秒）。`));
+        this.fail(new Error(`等待 IMAP 服务器问候超时（${IMAP_CONNECT_TIMEOUT_MS / 1000} 秒，第 ${attempt} 次）。`));
         this.socket?.destroy();
       }, IMAP_CONNECT_TIMEOUT_MS);
       this.socket = tlsConnect(this.port, this.host, { servername: this.host }, () => {});
@@ -1058,10 +1144,7 @@ async function withAuthenticatedClient(clientId, refreshToken, email, callback) 
   return withTimeout(
     (async () => {
       try {
-        const token = await refreshAccessToken(clientId, refreshToken);
-        if (token.refreshToken && token.refreshToken !== refreshToken) {
-          saveRotatedRefreshToken(email, token.refreshToken);
-        }
+        const token = await refreshCredentialAccessToken(email);
         await client.connect();
         await client.authenticate(email, token.accessToken);
         return await callback(client);
@@ -1075,12 +1158,12 @@ async function withAuthenticatedClient(clientId, refreshToken, email, callback) 
   );
 }
 
-async function listFolders(clientId, refreshToken, email) {
-  return withAuthenticatedClient(clientId, refreshToken, email, (client) => client.listMailboxes());
+async function listFolders(_clientId, _refreshToken, email) {
+  return withAuthenticatedClient(_clientId, _refreshToken, email, (client) => client.listMailboxes());
 }
 
-async function refreshAndFetch(clientId, refreshToken, email, folder = "INBOX") {
-  return withAuthenticatedClient(clientId, refreshToken, email, async (client) => {
+async function refreshAndFetch(_clientId, _refreshToken, email, folder = "INBOX") {
+  return withAuthenticatedClient(_clientId, _refreshToken, email, async (client) => {
     await client.selectMailbox(folder);
     const unreadCount = await client.unreadCount();
     const ids = await client.latestUids(3);
@@ -1104,8 +1187,8 @@ async function refreshAndFetch(clientId, refreshToken, email, folder = "INBOX") 
   });
 }
 
-async function markMessagesRead(clientId, refreshToken, email, folder = "INBOX", uids = []) {
-  return withAuthenticatedClient(clientId, refreshToken, email, async (client) => {
+async function markMessagesRead(_clientId, _refreshToken, email, folder = "INBOX", uids = []) {
+  return withAuthenticatedClient(_clientId, _refreshToken, email, async (client) => {
     await client.selectMailbox(folder);
     const markedCount = await client.markSeen(uids);
     const unreadCount = await client.unreadCount();
@@ -1153,32 +1236,32 @@ async function refreshStoredTokens(reason = "scheduled") {
   };
   const errors = [];
 
-  for (const credential of credentials) {
-    try {
-      const token = await refreshAccessToken(credential.clientId, credential.refreshToken);
-      summary.refreshed += 1;
-      if (token.refreshToken && token.refreshToken !== credential.refreshToken) {
-        saveRotatedRefreshToken(credential.email, token.refreshToken);
-        summary.rotated += 1;
+  try {
+    for (const credential of credentials) {
+      try {
+        const token = await refreshCredentialAccessToken(credential.email);
+        summary.refreshed += 1;
+        if (token.rotated) summary.rotated += 1;
+      } catch (error) {
+        summary.failed += 1;
+        errors.push({
+          email: credential.email,
+          error: error.message,
+        });
       }
-    } catch (error) {
-      summary.failed += 1;
-      errors.push({
-        email: credential.email,
-        error: error.message,
-      });
+      await delay(250);
     }
-    await delay(250);
-  }
 
-  tokenKeepaliveState.running = false;
-  tokenKeepaliveState.lastFinishedAt = nowIso();
-  tokenKeepaliveState.lastSummary = summary;
-  tokenKeepaliveState.lastErrors = errors.slice(-20);
-  console.log(
-    `Token keepalive ${reason}: ${summary.refreshed}/${summary.total} refreshed, ${summary.rotated} rotated, ${summary.failed} failed`,
-  );
-  return summary;
+    tokenKeepaliveState.lastSummary = summary;
+    tokenKeepaliveState.lastErrors = errors.slice(-20);
+    console.log(
+      `Token keepalive ${reason}: ${summary.refreshed}/${summary.total} refreshed, ${summary.rotated} rotated, ${summary.failed} failed`,
+    );
+    return summary;
+  } finally {
+    tokenKeepaliveState.running = false;
+    tokenKeepaliveState.lastFinishedAt = nowIso();
+  }
 }
 
 function startTokenKeepalive() {
