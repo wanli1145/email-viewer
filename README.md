@@ -1,12 +1,36 @@
 # Outlook OAuth2 IMAP 内部测试工具
 
-当前版本：v1.1
+当前版本：v2.0
 
-本项目是一个本地 Web 端测试工具，用于读取管理员预置的 Outlook OAuth2 凭证。
+本项目是一个本地桌面测试工具，用于读取管理员预置的 Outlook OAuth2 凭证。
 
-它不包含 OAuth Redirect、授权页面、本地回调或 Web Server 授权交换逻辑。浏览器只负责展示账号列表和邮件内容；refresh token、access token、SQLite 与 IMAP XOAUTH2 都只在本地 Node 后端处理。
+它不包含 OAuth Redirect、授权页面、本地回调或 Web Server 授权交换逻辑。界面只负责展示账号列表和邮件内容；refresh token、access token、SQLite 与 IMAP XOAUTH2 都只在本地 Node 后端处理。
 
 ## 启动
+
+### 桌面 App
+
+开发模式：
+
+```bash
+npm run app:dev
+```
+
+打包 macOS App：
+
+```bash
+npm run app:pack
+```
+
+生成 dmg：
+
+```bash
+npm run app:dist
+```
+
+桌面 App 会自动启动本地后端，并使用系统分配的空闲端口。SQLite 默认保存到系统应用数据目录；首次启动时，如果项目目录下已有 `data/oauth_imap_credentials.sqlite3`，会自动复制一份到 App 数据目录。
+
+### 网页调试模式
 
 ```bash
 runoutlook
@@ -34,6 +58,8 @@ user@example.com,xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx,0.A...
 ```text
 data/oauth_imap_credentials.sqlite3
 ```
+
+桌面 App 模式下，首次启动会把该文件复制到 App 数据目录，后续读写 App 数据目录中的数据库。
 
 也可以通过环境变量指定数据库：
 

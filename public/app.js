@@ -1,5 +1,5 @@
 const app = document.querySelector("#app");
-const APP_VERSION = "v1.1";
+const APP_VERSION = "v2.0";
 
 const state = {
   accounts: [],
@@ -15,8 +15,10 @@ const state = {
   batchBusy: false,
   batchProgress: { done: 0, total: 0 },
   actionsExpanded: false,
+  importExpanded: false,
   sidebarCollapsed: false,
-  markReadBusy: false,
+  sites: [],
+  siteBusy: false,
   tokenBusy: false,
   tokenStatus: null,
   accountSort: "email",
@@ -149,8 +151,9 @@ function messageCountLabel(messages) {
 }
 
 async function boot() {
-  const data = await api("/api/accounts");
-  state.accounts = data.accounts || [];
+  const [accountsData, sitesData] = await Promise.all([api("/api/accounts"), api("/api/sites")]);
+  state.accounts = accountsData.accounts || [];
+  state.sites = sitesData.sites || [];
   state.selectedId = state.accounts[0]?.id || null;
   render();
   if (state.selectedId) loadFolders(state.selectedId, false);
@@ -232,8 +235,35 @@ function renderAccountRow(account, index) {
           <span class="badge">更新 ${formatDate(account.updatedAt)}</span>
           ${renderAccountStatusBadges(refresh)}
         </div>
+        ${renderSiteDots(account)}
         ${renderAccountSummary(refresh)}
       </div>
+    </div>
+  `;
+}
+
+function renderSiteDots(account) {
+  if (!state.sites.length) return "";
+  const marked = new Set(account.siteIds || []);
+  return html`
+    <div class="site-dot-row" aria-label="网站标记">
+      ${state.sites
+        .map((site) => {
+          const active = marked.has(site.id);
+          return `
+            <button
+              class="site-chip ${active ? "active" : ""}"
+              data-site-toggle="${account.id}"
+              data-site-id="${site.id}"
+              aria-label="${escapeHtml(account.email)} ${active ? "取消" : "标记"} ${escapeHtml(site.name)}"
+              title="${escapeHtml(site.name)}：${active ? "已标记，点击取消" : "未标记，点击标记"}"
+            >
+              <span class="site-dot" aria-hidden="true"></span>
+              <span class="site-name">${escapeHtml(site.name)}</span>
+            </button>
+          `;
+        })
+        .join("")}
     </div>
   `;
 }
@@ -311,20 +341,58 @@ function renderActionsPanel(account) {
         ${renderTokenStatus()}
       </div>
       <div class="import-box">
-        <div>
-          <h2>导入凭证</h2>
-          <p class="muted tiny">支持 CSV，或 email----标识----client_id----refresh_token</p>
-        </div>
-        <div class="import-body">
-          <textarea id="csv-input" spellcheck="false" placeholder="email----标识----client_id----refresh_token
-user@example.com----note----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.A..."></textarea>
-          <div class="import-actions">
-            <div id="import-result" class="muted tiny"></div>
-            <button id="import-csv" class="primary">写入 SQLite</button>
+        <div class="collapsible-header">
+          <div>
+            <h2>导入凭证</h2>
+            <p class="muted tiny">支持 CSV，或 email----标识----client_id----refresh_token</p>
           </div>
+          <button id="toggle-import" class="icon-button" aria-label="${state.importExpanded ? "收起导入凭证" : "展开导入凭证"}" title="${state.importExpanded ? "收起" : "展开"}" aria-expanded="${state.importExpanded ? "true" : "false"}">
+            ${icon(state.importExpanded ? "chevron-up" : "chevron-down")}
+          </button>
         </div>
+        ${state.importExpanded
+          ? `
+            <div class="import-body">
+              <textarea id="csv-input" spellcheck="false" placeholder="email----标识----client_id----refresh_token
+user@example.com----note----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.A..."></textarea>
+              <div class="import-actions">
+                <div id="import-result" class="muted tiny"></div>
+                <button id="import-csv" class="primary">写入 SQLite</button>
+              </div>
+            </div>
+          `
+          : ""}
+      </div>
+      <div class="site-box">
+        <div>
+          <h2>网站标记</h2>
+          <p class="muted tiny">输入自定义网站后，会出现在每个邮箱旁边的小圆圈里。</p>
+        </div>
+        <form id="site-form" class="site-form">
+          <input id="site-input" type="text" placeholder="例如 github.com、amazon、paypal" autocomplete="off" />
+          <button class="primary" ${state.siteBusy ? "disabled" : ""}>${state.siteBusy ? "添加中" : "加入列表"}</button>
+        </form>
+        ${renderSiteList()}
       </div>
     </section>
+  `;
+}
+
+function renderSiteList() {
+  if (!state.sites.length) return `<div class="empty compact">暂无网站。添加后可在账号旁边标记。</div>`;
+  return html`
+    <div class="site-list">
+      ${state.sites
+        .map(
+          (site) => `
+            <div class="site-list-item">
+              <span><i class="site-dot active" aria-hidden="true"></i>${escapeHtml(site.name)}</span>
+              <button class="danger small-button" data-site-delete="${site.id}" ${state.siteBusy ? "disabled" : ""}>删除</button>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
   `;
 }
 
@@ -376,17 +444,10 @@ function renderMailPanel(account) {
         <button id="reload-folders" ${state.busy || state.folderBusy || state.batchBusy ? "disabled" : ""}>
           ${state.folderBusy ? "加载中" : "重新扫描文件夹"}
         </button>
-        <button id="mark-all-read" ${state.markReadBusy || state.busy || state.batchBusy || !readableUids().length ? "disabled" : ""}>
-          ${state.markReadBusy ? "标记中" : "标为已读"}
-        </button>
       </div>
       ${renderMessages()}
     </section>
   `;
-}
-
-function readableUids() {
-  return state.messages.map((message) => message.uid).filter(Boolean);
 }
 
 function renderFolderOptions(folders, selected) {
@@ -446,6 +507,16 @@ function icon(name) {
         <path d="m13 9 3 3-3 3" />
       </svg>
     `,
+    "chevron-down": `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="m6 9 6 6 6-6" />
+      </svg>
+    `,
+    "chevron-up": `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="m18 15-6-6-6 6" />
+      </svg>
+    `,
   };
   return icons[name] || "";
 }
@@ -461,9 +532,6 @@ function renderMessageCard(message, index) {
         </div>
         <span class="badge ${isError ? "error" : "ok"}">${isError ? "错误" : "邮件"}</span>
       </div>
-      ${message.uid && !isError
-        ? `<div class="message-actions"><button data-mark-read="${escapeHtml(message.uid)}" ${state.markReadBusy ? "disabled" : ""}>标为已读</button></div>`
-        : ""}
       <dl class="message-meta-grid">
         <div>
           <dt>发件人</dt>
@@ -533,6 +601,14 @@ function bindEvents() {
     render();
   });
   document.querySelector("#import-csv")?.addEventListener("click", importCsv);
+  document.querySelector("#toggle-import")?.addEventListener("click", () => {
+    state.importExpanded = !state.importExpanded;
+    render();
+  });
+  document.querySelector("#site-form")?.addEventListener("submit", addSite);
+  document.querySelectorAll("[data-site-delete]").forEach((button) => {
+    button.addEventListener("click", () => deleteSite(button.dataset.siteDelete));
+  });
   document.querySelector(".sidebar")?.addEventListener("scroll", (event) => {
     state.sidebarScrollTop = event.currentTarget.scrollTop;
   });
@@ -560,6 +636,12 @@ function bindEvents() {
       selectAccount();
     });
   });
+  document.querySelectorAll("[data-site-toggle]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleSiteMark(button.dataset.siteToggle, Number(button.dataset.siteId));
+    });
+  });
   document.querySelectorAll("[data-copy-email]").forEach((button) => {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -572,10 +654,6 @@ function bindEvents() {
   document.querySelectorAll("[data-private-link]").forEach((button) => {
     button.addEventListener("click", () => openPrivate(button.dataset.privateLink));
   });
-  document.querySelectorAll("[data-mark-read]").forEach((button) => {
-    button.addEventListener("click", () => markRead([button.dataset.markRead]));
-  });
-  document.querySelector("#mark-all-read")?.addEventListener("click", () => markRead(readableUids()));
   document.querySelector("#reload-folders")?.addEventListener("click", () => {
     const account = selectedAccount();
     if (account) loadFolders(account.id, true);
@@ -652,6 +730,77 @@ async function reloadAccounts() {
     if (state.selectedId) loadFolders(state.selectedId, false);
   } catch (error) {
     toast(error.message);
+  }
+}
+
+async function addSite(event) {
+  event.preventDefault();
+  const input = document.querySelector("#site-input");
+  const site = input?.value.trim();
+  if (!site) return;
+  try {
+    state.siteBusy = true;
+    render();
+    const data = await api("/api/sites", {
+      method: "POST",
+      body: JSON.stringify({ site }),
+      timeoutMs: 10_000,
+    });
+    state.sites = data.sites || [];
+    toast(`已加入网站：${site}`);
+  } catch (error) {
+    toast(`添加网站失败：${error.message}`);
+  } finally {
+    state.siteBusy = false;
+    render();
+  }
+}
+
+async function deleteSite(siteId) {
+  try {
+    state.siteBusy = true;
+    render();
+    const data = await api(`/api/sites/${siteId}`, {
+      method: "DELETE",
+      timeoutMs: 10_000,
+    });
+    state.sites = data.sites || [];
+    state.accounts = data.accounts || state.accounts;
+    toast("已删除网站标记。");
+  } catch (error) {
+    toast(`删除网站失败：${error.message}`);
+  } finally {
+    state.siteBusy = false;
+    render();
+  }
+}
+
+async function toggleSiteMark(accountId, siteId) {
+  const account = state.accounts.find((item) => item.id === accountId);
+  if (!account || !siteId) return;
+  const current = new Set(account.siteIds || []);
+  const marked = !current.has(siteId);
+  if (marked) current.add(siteId);
+  else current.delete(siteId);
+  account.siteIds = [...current];
+  preserveSidebarScroll(() => render());
+
+  try {
+    const data = await api(`/api/accounts/${accountId}/sites/${siteId}`, {
+      method: "PUT",
+      body: JSON.stringify({ marked }),
+      timeoutMs: 10_000,
+    });
+    state.accounts = data.accounts || state.accounts;
+    const site = state.sites.find((item) => item.id === siteId);
+    toast(`${account.email} ${marked ? "已标记" : "已取消"} ${site?.name || "网站"}`);
+  } catch (error) {
+    if (marked) current.delete(siteId);
+    else current.add(siteId);
+    account.siteIds = [...current];
+    toast(`网站标记失败：${error.message}`);
+  } finally {
+    preserveSidebarScroll(() => render());
   }
 }
 
@@ -738,49 +887,6 @@ async function fetchMessages(id) {
     };
   } finally {
     state.busy = false;
-    render();
-  }
-}
-
-async function markRead(uids) {
-  const account = selectedAccount();
-  const ids = [...new Set((uids || []).filter(Boolean))];
-  if (!account || !ids.length) return;
-  try {
-    state.markReadBusy = true;
-    render();
-    const data = await api(`/api/accounts/${account.id}/mark-read`, {
-      method: "POST",
-      body: JSON.stringify({ folder: selectedFolder(account.id), uids: ids }),
-      timeoutMs: 95_000,
-    });
-    state.unreadCount = data.unreadCount ?? null;
-    state.fetchedAt = data.account?.fetchedAt || new Date().toISOString();
-    const marked = new Set(ids);
-    state.messages = state.messages.filter((message) => !marked.has(String(message.uid || "")));
-    const currentRefresh = accountRefreshState(account.id);
-    state.refreshStateByAccount[account.id] = {
-      ...currentRefresh,
-      status: "ok",
-      folder: selectedFolder(account.id),
-      unreadCount: state.unreadCount,
-      messages: state.messages,
-      fetchedAt: state.fetchedAt,
-    };
-    toast(`已标记 ${data.markedCount || ids.length} 封邮件为已读。`);
-  } catch (error) {
-    state.messages = [
-      {
-        from: "Error",
-        date: new Date().toISOString(),
-        subject: "标为已读失败",
-        body: error.message,
-      },
-      ...state.messages,
-    ];
-    toast(`标为已读失败：${error.message}`);
-  } finally {
-    state.markReadBusy = false;
     render();
   }
 }

@@ -2,17 +2,16 @@ import { createServer } from "node:http";
 import { mkdir, readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { extname, join, normalize } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, extname, join, normalize } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { connect as tlsConnect } from "node:tls";
 import { DatabaseSync } from "node:sqlite";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const PORT = Number(process.env.PORT || 1111);
-const HOST = process.env.HOST || "127.0.0.1";
-const DATA_DIR = join(__dirname, "data");
-const DB_FILE = process.env.OAUTH_IMAP_DB || join(DATA_DIR, "oauth_imap_credentials.sqlite3");
-const PUBLIC_DIR = join(__dirname, "public");
+const DEFAULT_PORT = Number(process.env.PORT || 1111);
+const DEFAULT_HOST = process.env.HOST || "127.0.0.1";
+const DEFAULT_DB_FILE = process.env.OAUTH_IMAP_DB || join(__dirname, "data", "oauth_imap_credentials.sqlite3");
+const DEFAULT_PUBLIC_DIR = join(__dirname, "public");
 const TENANT_ID = process.env.MS_TENANT_ID || "common";
 const TOKEN_URL = `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`;
 const TOKEN_SCOPE =
@@ -26,6 +25,10 @@ const FETCH_TIMEOUT_MS = Number(process.env.MS_FETCH_TIMEOUT_MS || 60_000);
 const IMAP_CONNECT_RETRIES = Number(process.env.MS_IMAP_CONNECT_RETRIES || 3);
 const TOKEN_KEEPALIVE_INTERVAL_MS = Number(process.env.MS_TOKEN_KEEPALIVE_INTERVAL_MS || 6 * 60 * 60 * 1000);
 const TOKEN_KEEPALIVE_START_DELAY_MS = Number(process.env.MS_TOKEN_KEEPALIVE_START_DELAY_MS || 30_000);
+let PUBLIC_DIR = DEFAULT_PUBLIC_DIR;
+let DB_FILE = DEFAULT_DB_FILE;
+let db = null;
+let tokenKeepaliveTimers = [];
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -34,22 +37,41 @@ const mimeTypes = {
   ".json": "application/json; charset=utf-8",
 };
 
-await mkdir(DATA_DIR, { recursive: true });
-const db = new DatabaseSync(DB_FILE);
-db.exec(`
-  CREATE TABLE IF NOT EXISTS credentials (
-    email TEXT PRIMARY KEY,
-    client_id TEXT NOT NULL,
-    refresh_token TEXT NOT NULL,
-    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+async function initializeDatabase(dbFile) {
+  DB_FILE = dbFile;
+  await mkdir(dirname(DB_FILE), { recursive: true });
+  if (db) db.close();
+  db = new DatabaseSync(DB_FILE);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS credentials (
+      email TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL,
+      refresh_token TEXT NOT NULL,
+      imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      site_key TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 
-const credentialColumns = db.prepare("PRAGMA table_info(credentials)").all();
-if (!credentialColumns.some((column) => column.name === "imported_at")) {
-  db.exec("ALTER TABLE credentials ADD COLUMN imported_at TEXT");
-  db.exec("UPDATE credentials SET imported_at = COALESCE(updated_at, CURRENT_TIMESTAMP) WHERE imported_at IS NULL");
+    CREATE TABLE IF NOT EXISTS account_site_marks (
+      email TEXT NOT NULL,
+      site_id INTEGER NOT NULL,
+      marked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (email, site_id)
+    )
+  `);
+
+  const credentialColumns = db.prepare("PRAGMA table_info(credentials)").all();
+  if (!credentialColumns.some((column) => column.name === "imported_at")) {
+    db.exec("ALTER TABLE credentials ADD COLUMN imported_at TEXT");
+    db.exec("UPDATE credentials SET imported_at = COALESCE(updated_at, CURRENT_TIMESTAMP) WHERE imported_at IS NULL");
+  }
 }
 
 function nowIso() {
@@ -201,13 +223,80 @@ function listAccounts() {
       `,
     )
     .all();
+  const marks = db.prepare("SELECT email, site_id AS siteId FROM account_site_marks").all();
+  const siteIdsByEmail = new Map();
+  for (const mark of marks) {
+    const key = mark.email.trim().toLowerCase();
+    siteIdsByEmail.set(key, [...(siteIdsByEmail.get(key) || []), mark.siteId]);
+  }
   return rows.map((row) => ({
     id: accountId(row.email),
     email: row.email,
     clientId: row.clientId,
     importedAt: row.importedAt,
     updatedAt: row.updatedAt,
+    siteIds: siteIdsByEmail.get(row.email.trim().toLowerCase()) || [],
   }));
+}
+
+function normalizeSiteInput(value) {
+  let site = String(value || "").trim();
+  if (!site) throw new Error("网站名称不能为空。");
+  if (/^https?:\/\//i.test(site)) {
+    const parsed = new URL(site);
+    site = parsed.hostname;
+  }
+  site = site.replace(/^www\./i, "").replace(/\/+$/, "").trim();
+  if (!site || site.length > 80) throw new Error("网站名称长度需在 1 到 80 个字符之间。");
+  return {
+    name: site,
+    siteKey: site.toLowerCase(),
+  };
+}
+
+function listSites() {
+  return db
+    .prepare("SELECT id, name, created_at AS createdAt FROM sites ORDER BY name COLLATE NOCASE")
+    .all();
+}
+
+function createSite(value) {
+  const site = normalizeSiteInput(value);
+  db.prepare(
+    `
+    INSERT INTO sites (name, site_key, created_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(site_key) DO UPDATE SET name = excluded.name
+    `,
+  ).run(site.name, site.siteKey);
+  return listSites();
+}
+
+function deleteSite(siteId) {
+  const id = Number(siteId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("网站 ID 不正确。");
+  db.prepare("DELETE FROM account_site_marks WHERE site_id = ?").run(id);
+  const result = db.prepare("DELETE FROM sites WHERE id = ?").run(id);
+  if (!result.changes) throw new Error("未找到该网站。");
+}
+
+function setSiteMark(accountHash, siteId, marked) {
+  const credential = findCredential(accountHash);
+  const id = Number(siteId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("网站 ID 不正确。");
+  const site = db.prepare("SELECT id FROM sites WHERE id = ?").get(id);
+  if (!site) throw new Error("未找到该网站。");
+  if (marked) {
+    db.prepare(
+      `
+      INSERT INTO account_site_marks (email, site_id, marked_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(email, site_id) DO UPDATE SET marked_at = CURRENT_TIMESTAMP
+      `,
+    ).run(credential.email, id);
+  } else {
+    db.prepare("DELETE FROM account_site_marks WHERE email = ? AND site_id = ?").run(credential.email, id);
+  }
 }
 
 function findCredential(id) {
@@ -1265,27 +1354,65 @@ async function refreshStoredTokens(reason = "scheduled") {
 }
 
 function startTokenKeepalive() {
+  stopTokenKeepalive();
   if (!TOKEN_KEEPALIVE_INTERVAL_MS || TOKEN_KEEPALIVE_INTERVAL_MS < 60_000) return;
-  setTimeout(() => {
+  const startupTimer = setTimeout(() => {
     refreshStoredTokens("startup").catch((error) => {
       tokenKeepaliveState.running = false;
       tokenKeepaliveState.lastErrors = [{ email: "*", error: error.message }];
       console.error(`Token keepalive startup failed: ${error.message}`);
     });
-  }, TOKEN_KEEPALIVE_START_DELAY_MS).unref();
+  }, TOKEN_KEEPALIVE_START_DELAY_MS);
+  startupTimer.unref();
 
-  setInterval(() => {
+  const intervalTimer = setInterval(() => {
     refreshStoredTokens("scheduled").catch((error) => {
       tokenKeepaliveState.running = false;
       tokenKeepaliveState.lastErrors = [{ email: "*", error: error.message }];
       console.error(`Token keepalive scheduled failed: ${error.message}`);
     });
-  }, TOKEN_KEEPALIVE_INTERVAL_MS).unref();
+  }, TOKEN_KEEPALIVE_INTERVAL_MS);
+  intervalTimer.unref();
+  tokenKeepaliveTimers = [startupTimer, intervalTimer];
+}
+
+function stopTokenKeepalive() {
+  for (const timer of tokenKeepaliveTimers) {
+    clearTimeout(timer);
+    clearInterval(timer);
+  }
+  tokenKeepaliveTimers = [];
 }
 
 async function routeApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/accounts") {
     jsonResponse(res, 200, { accounts: listAccounts() });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/sites") {
+    jsonResponse(res, 200, { sites: listSites() });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/sites") {
+    const body = await getBody(req);
+    jsonResponse(res, 200, { sites: createSite(body.site || body.name) });
+    return;
+  }
+
+  if (req.method === "DELETE" && url.pathname.match(/^\/api\/sites\/\d+$/)) {
+    const siteId = url.pathname.split("/")[3];
+    deleteSite(siteId);
+    jsonResponse(res, 200, { ok: true, sites: listSites(), accounts: listAccounts() });
+    return;
+  }
+
+  if (req.method === "PUT" && url.pathname.match(/^\/api\/accounts\/[^/]+\/sites\/\d+$/)) {
+    const [, , , accountHash, , siteId] = url.pathname.split("/");
+    const body = await getBody(req);
+    setSiteMark(accountHash, siteId, Boolean(body.marked));
+    jsonResponse(res, 200, { ok: true, accounts: listAccounts() });
     return;
   }
 
@@ -1406,23 +1533,66 @@ async function serveStatic(_req, res, url) {
   }
 }
 
-const server = createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url || "/", `http://${req.headers.host || `localhost:${PORT}`}`);
-    if (url.pathname.startsWith("/api/")) {
-      await routeApi(req, res, url);
-      return;
+function createRequestHandler(port) {
+  return async (req, res) => {
+    try {
+      const url = new URL(req.url || "/", `http://${req.headers.host || `localhost:${port}`}`);
+      if (url.pathname.startsWith("/api/")) {
+        await routeApi(req, res, url);
+        return;
+      }
+      await serveStatic(req, res, url);
+    } catch (error) {
+      console.error(error.stack || error.message || error);
+      jsonResponse(res, 500, { error: error.message || "服务器内部错误。" });
     }
-    await serveStatic(req, res, url);
-  } catch (error) {
-    console.error(error.stack || error.message || error);
-    jsonResponse(res, 500, { error: error.message || "服务器内部错误。" });
-  }
-});
+  };
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`Internal OAuth2 IMAP viewer is running at http://${HOST}:${PORT}`);
+export async function startServer(options = {}) {
+  const host = options.host || DEFAULT_HOST;
+  const port = Number.isFinite(Number(options.port)) ? Number(options.port) : DEFAULT_PORT;
+  PUBLIC_DIR = options.publicDir || DEFAULT_PUBLIC_DIR;
+  await initializeDatabase(options.dbFile || DEFAULT_DB_FILE);
+
+  const server = createServer(createRequestHandler(port));
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    server.once("error", onError);
+    server.listen(port, host, () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+
+  const address = server.address();
+  const actualPort = typeof address === "object" && address ? address.port : port;
+  const url = `http://${host}:${actualPort}`;
+  console.log(`Internal OAuth2 IMAP viewer is running at ${url}`);
   console.log(`SQLite database: ${DB_FILE}`);
   console.log(`Token keepalive interval: ${Math.round(TOKEN_KEEPALIVE_INTERVAL_MS / 60000)} minutes`);
   startTokenKeepalive();
-});
+
+  return {
+    server,
+    host,
+    port: actualPort,
+    url,
+    dbFile: DB_FILE,
+    close: async () => {
+      stopTokenKeepalive();
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+      db?.close();
+      db = null;
+    },
+  };
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startServer().catch((error) => {
+    console.error(error.stack || error.message || error);
+    process.exitCode = 1;
+  });
+}
