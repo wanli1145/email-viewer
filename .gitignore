@@ -3,3 +3,12 @@ dist/
 .DS_Store
 node_modules/
 npm-debug.log*
+
+# Local editor and agent state
+.idea/
+.claude/
+
+# Local working copies and source-image duplicates
+.backup-public-*/
+/app.js
+/image.png

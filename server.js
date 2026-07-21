@@ -12,11 +12,15 @@ const DEFAULT_PORT = Number(process.env.PORT || 1111);
 const DEFAULT_HOST = process.env.HOST || "127.0.0.1";
 const DEFAULT_DB_FILE = process.env.OAUTH_IMAP_DB || join(__dirname, "data", "oauth_imap_credentials.sqlite3");
 const DEFAULT_PUBLIC_DIR = join(__dirname, "public");
+const APP_VERSION = "2.1.0";
 const TENANT_ID = process.env.MS_TENANT_ID || "common";
 const TOKEN_URL = `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`;
 const TOKEN_SCOPE =
   process.env.MS_TOKEN_SCOPE || "https://outlook.office.com/IMAP.AccessAsUser.All offline_access";
 const IMAP_HOST = process.env.MS_IMAP_HOST || "outlook.office365.com";
+const IMAP_HOSTS = process.env.MS_IMAP_HOSTS
+  ? process.env.MS_IMAP_HOSTS.split(",").map((host) => host.trim()).filter(Boolean)
+  : [...new Set([IMAP_HOST, "imap-mail.outlook.com"])];
 const IMAP_PORT = Number(process.env.MS_IMAP_PORT || 993);
 const TOKEN_TIMEOUT_MS = Number(process.env.MS_TOKEN_TIMEOUT_MS || 20_000);
 const IMAP_CONNECT_TIMEOUT_MS = Number(process.env.MS_IMAP_CONNECT_TIMEOUT_MS || 15_000);
@@ -78,6 +82,30 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function createFailureError(message, failure = {}) {
+  const error = new Error(message);
+  error.failure = {
+    source: failure.source || "unknown",
+    kind: failure.kind || "unknown",
+    code: failure.code || "",
+    terminal: Boolean(failure.terminal),
+    retryable: Boolean(failure.retryable),
+  };
+  return error;
+}
+
+function serializeFailure(error) {
+  const retryable = Boolean(error?.failure?.retryable || isRetryableNetworkError(error || new Error("")));
+  return {
+    source: error?.failure?.source || "unknown",
+    kind: error?.failure?.kind || (retryable ? "temporary" : "unknown"),
+    code: error?.failure?.code || error?.code || "",
+    terminal: Boolean(error?.failure?.terminal),
+    retryable,
+    message: error?.message || "未知错误",
+  };
+}
+
 function accountId(email) {
   return createHash("sha256").update(email.trim().toLowerCase()).digest("hex").slice(0, 18);
 }
@@ -88,6 +116,33 @@ function jsonResponse(res, status, body) {
     "cache-control": "no-store",
   });
   res.end(JSON.stringify(body));
+}
+
+function isLocalOrigin(origin) {
+  if (!origin) return false;
+  try {
+    const parsed = new URL(origin);
+    return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function applyCors(req, res) {
+  const origin = req.headers.origin;
+  if (!isLocalOrigin(origin)) return;
+  res.setHeader("access-control-allow-origin", origin);
+  res.setHeader("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.setHeader("access-control-allow-headers", "content-type");
+  res.setHeader("access-control-max-age", "600");
+  res.setHeader("vary", "Origin");
+}
+
+function apiErrorStatus(error) {
+  const message = error?.message || "";
+  if (message.includes("未找到")) return 404;
+  if (message.includes("不正确") || message.includes("不能为空") || message.includes("有效 JSON")) return 400;
+  return 500;
 }
 
 function getBody(req) {
@@ -299,6 +354,42 @@ function setSiteMark(accountHash, siteId, marked) {
   }
 }
 
+function deleteAccounts(ids) {
+  if (!Array.isArray(ids) || !ids.length) {
+    throw new Error("账号 ID 列表不能为空。");
+  }
+  if (ids.some((id) => typeof id !== "string" || !id.trim())) {
+    throw new Error("账号 ID 不正确。");
+  }
+  const accountIds = [...new Set(ids.map((id) => id.trim()))];
+
+  const credentials = db.prepare("SELECT email FROM credentials").all();
+  const credentialsById = new Map(credentials.map((credential) => [accountId(credential.email), credential]));
+  const emails = [];
+  for (const id of accountIds) {
+    const credential = credentialsById.get(id);
+    if (!credential) throw new Error(`未找到该账号：${id}`);
+    emails.push(credential.email);
+  }
+
+  const removeMarks = db.prepare("DELETE FROM account_site_marks WHERE email = ?");
+  const removeCredentials = db.prepare(`DELETE FROM credentials WHERE email = ?`);
+
+  let deleted = 0;
+  db.exec("BEGIN");
+  try {
+    for (const email of emails) {
+      removeMarks.run(email);
+      deleted += Number(removeCredentials.run(email).changes || 0);
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  return { deleted, accounts: listAccounts() };
+}
+
 function findCredential(id) {
   const row = db
     .prepare("SELECT email, client_id AS clientId, refresh_token AS refreshToken FROM credentials")
@@ -412,29 +503,90 @@ async function refreshAccessTokenOnce(clientId, refreshToken, attempt) {
     });
   } catch (error) {
     if (error.name === "AbortError") {
-      throw new Error(`刷新 access_token 超时（${TOKEN_TIMEOUT_MS / 1000} 秒，第 ${attempt} 次）。`);
+      throw createFailureError(`刷新 access_token 超时（${TOKEN_TIMEOUT_MS / 1000} 秒，第 ${attempt} 次）。`, {
+        source: "token",
+        kind: "temporary",
+        code: "timeout",
+        retryable: true,
+      });
     }
     const cause = error.cause?.code || error.cause?.message || error.code || error.message;
-    throw new Error(`Microsoft token 网络请求失败（第 ${attempt} 次）：${cause}`);
+    throw createFailureError(`Microsoft token 网络请求失败（第 ${attempt} 次）：${cause}`, {
+      source: "token",
+      kind: "temporary",
+      code: String(cause || "network_error"),
+      retryable: true,
+    });
   } finally {
     clearTimeout(timer);
   }
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     const description = body.error_description || body.error || `Microsoft token endpoint ${response.status}`;
+    const aadCode = description.match(/\bAADSTS\d+\b/i)?.[0]?.toUpperCase() || "";
     if (description.includes("AADSTS65001")) {
-      throw new Error(
+      throw createFailureError(
         `${description}\n\n该 refresh token 尚未被授予当前请求的 IMAP 权限。请在 Microsoft/Entra 侧预先同意应用的 IMAP.AccessAsUser.All 权限，或导入已经包含该权限的 refresh_token。`,
+        { source: "token", kind: "permission_required", code: aadCode || "AADSTS65001" },
       );
     }
-    if (body.error === "invalid_grant" || description.includes("AADSTS70000")) {
-      throw new Error(
+    if (aadCode === "AADSTS50034") {
+      throw createFailureError(description, {
+        source: "token",
+        kind: "account_not_found",
+        code: aadCode,
+        terminal: true,
+      });
+    }
+    if (aadCode === "AADSTS50057") {
+      throw createFailureError(description, {
+        source: "token",
+        kind: "account_disabled",
+        code: aadCode,
+        terminal: true,
+      });
+    }
+    if (
+      body.error === "invalid_grant"
+      || ["AADSTS50173", "AADSTS70000", "AADSTS700082", "AADSTS700084"].includes(aadCode)
+    ) {
+      throw createFailureError(
         `${description}\n\n该 refresh token 可能已经过期、被撤销或被新 token 替换。请重新导入该账号最新的 refresh_token。`,
+        {
+          source: "token",
+          kind: "credential_invalid",
+          code: aadCode || body.error || "invalid_grant",
+          terminal: true,
+        },
       );
     }
-    throw new Error(description);
+    if (
+      response.status === 408
+      || response.status === 429
+      || response.status >= 500
+      || body.error === "server_error"
+      || body.error === "temporarily_unavailable"
+    ) {
+      throw createFailureError(description, {
+        source: "token",
+        kind: "temporary",
+        code: aadCode || body.error || `HTTP_${response.status}`,
+        retryable: true,
+      });
+    }
+    throw createFailureError(description, {
+      source: "token",
+      kind: "token_error",
+      code: aadCode || body.error || `HTTP_${response.status}`,
+    });
   }
-  if (!body.access_token) throw new Error("Token 接口未返回 access_token。");
+  if (!body.access_token) {
+    throw createFailureError("Token 接口未返回 access_token。", {
+      source: "token",
+      kind: "token_error",
+      code: "missing_access_token",
+    });
+  }
   return {
     accessToken: body.access_token,
     refreshToken: body.refresh_token || "",
@@ -445,20 +597,48 @@ function isRetryableNetworkError(error) {
   return /网络请求失败|超时|fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(error.message);
 }
 
+function decodeJwtPayload(token) {
+  const payload = String(token || "").split(".")[1];
+  if (!payload) return {};
+  try {
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function microsoftAuthUsers(email, accessToken) {
+  const claims = decodeJwtPayload(accessToken);
+  const candidates = [
+    email,
+    claims.preferred_username,
+    claims.upn,
+    claims.unique_name,
+    claims.email,
+    claims.mail,
+  ];
+  return [...new Set(candidates
+    .map((value) => String(value || "").trim())
+    .filter((value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.toLowerCase()))
+    .map((value) => value.toLowerCase()))];
+}
+
 function isRetryableImapConnectError(error) {
   return /Client network socket disconnected|IMAP 连接已关闭|服务器问候超时|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(error?.message || "");
 }
 
-function normalizeImapConnectError(error) {
+function normalizeImapConnectError(error, host = IMAP_HOST) {
   const message = error?.message || "未知 IMAP 连接错误";
   if (/Client network socket disconnected/i.test(message)) {
     return new Error(
-      `连接 Outlook IMAP 失败：TLS 握手前网络连接被断开。已重试 ${IMAP_CONNECT_RETRIES} 次。请检查代理/VPN、防火墙、网络稳定性，或稍后再试。原始错误：${message}`,
+      `连接 Microsoft IMAP 失败（${host}:${IMAP_PORT}）：TLS 握手前网络连接被断开。已重试 ${IMAP_CONNECT_RETRIES} 次。请检查代理/VPN、防火墙、网络稳定性，或稍后再试。原始错误：${message}`,
     );
   }
   if (/服务器问候超时|ETIMEDOUT/i.test(message)) {
     return new Error(
-      `连接 Outlook IMAP 超时。已重试 ${IMAP_CONNECT_RETRIES} 次。请检查网络是否能访问 ${IMAP_HOST}:${IMAP_PORT}。原始错误：${message}`,
+      `连接 Microsoft IMAP 超时。已重试 ${IMAP_CONNECT_RETRIES} 次。请检查网络是否能访问 ${host}:${IMAP_PORT}。原始错误：${message}`,
     );
   }
   return error instanceof Error ? error : new Error(message);
@@ -595,6 +775,25 @@ function extractReadableBody(rawMessage) {
   return normalizeMailText(decoded);
 }
 
+function extractHtmlBody(rawMessage) {
+  const headers = parseHeaders(rawMessage);
+  const contentType = parseContentType(headers.get("content-type") || "text/plain");
+  const { body } = splitHeaderBody(rawMessage);
+
+  if (contentType.type.startsWith("multipart/")) {
+    const boundary = contentType.params.get("boundary");
+    if (!boundary) return "";
+    const parts = splitMultipart(body, boundary)
+      .map((part) => extractHtmlBody(part))
+      .filter((htmlPart) => htmlPart.trim());
+    return parts[0] || "";
+  }
+
+  const decoded = decodeTransfer(body, headers);
+  if (contentType.type === "text/html") return sanitizeMailHtml(decoded);
+  return "";
+}
+
 function extractLinks(rawMessage) {
   const headers = parseHeaders(rawMessage);
   const contentType = parseContentType(headers.get("content-type") || "text/plain");
@@ -620,6 +819,23 @@ function linksFromHtml(html) {
     links.push({ href, label });
   }
   return rankLinks([...links, ...linksFromText(htmlToText(html))]);
+}
+
+function sanitizeMailHtml(html) {
+  let safe = String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
+    .replace(/<object[\s\S]*?<\/object>/gi, "")
+    .replace(/<embed[\s\S]*?<\/embed>/gi, "")
+    .replace(/<link\b[^>]*>/gi, "")
+    .replace(/<meta\b[^>]*>/gi, "")
+    .replace(/\s+on[a-z]+\s*=\s*(["']).*?\1/gi, "")
+    .replace(/\s+on[a-z]+\s*=\s*[^\s>]+/gi, "")
+    .replace(/\s+(href|src)\s*=\s*(["'])\s*javascript:[\s\S]*?\2/gi, "")
+    .replace(/\s+(href|src)\s*=\s*(["'])\s*data:(?!image\/(?:png|jpe?g|gif|webp);)/gi, " $1=$2");
+  safe = safe.replace(/<a\b/gi, '<a target="_blank" rel="noopener noreferrer"');
+  return safe;
 }
 
 function linksFromText(text) {
@@ -742,6 +958,33 @@ function openPrivateWindow(url) {
   return spawnFirst(candidates);
 }
 
+function openNormalWindow(url) {
+  const safeUrl = assertSafeHttpUrl(url);
+  const candidates =
+    process.platform === "darwin"
+      ? [{ command: "open", args: [safeUrl] }]
+      : process.platform === "win32"
+        ? [{ command: "cmd", args: ["/c", "start", "", safeUrl] }]
+        : [
+            { command: "xdg-open", args: [safeUrl] },
+            { command: "open", args: [safeUrl] },
+          ];
+
+  return spawnFirst(candidates);
+}
+
+function restartDesktopApp() {
+  if (!process.env.ELECTRON_RUN_AS_NODE && process.versions.electron) {
+    setTimeout(async () => {
+      const { app } = await import("electron");
+      app.relaunch();
+      app.quit();
+    }, 100);
+    return true;
+  }
+  return false;
+}
+
 function spawnFirst(candidates) {
   return new Promise((resolve, reject) => {
     let index = 0;
@@ -795,6 +1038,13 @@ function htmlToText(html) {
       .replace(/<style[\s\S]*?<\/style>/gi, " ")
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
       .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+      .replace(/<a\b[^>]*href\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi, (_match, _quote, href, label) => {
+        const safeHref = decodeHtmlEntities(href.trim());
+        const text = normalizeMailText(htmlToText(label));
+        if (!isSafeLink(safeHref)) return text || " ";
+        if (!text || text === safeHref) return ` ${safeHref} `;
+        return ` ${text} ${safeHref} `;
+      })
       .replace(/<(br|hr)\b[^>]*>/gi, "\n")
       .replace(/<\/(p|div|tr|table|h[1-6]|li)>/gi, "\n")
       .replace(/<li\b[^>]*>/gi, "\n- ")
@@ -823,15 +1073,101 @@ function normalizeMailText(text) {
 function summarizeMessage(fetched) {
   const rawMessage = typeof fetched === "string" ? fetched : fetched.raw;
   const headers = parseHeaders(rawMessage);
-  return {
+  const message = {
     uid: typeof fetched === "string" ? "" : fetched.uid,
     receivedAt: typeof fetched === "string" ? "" : fetched.internalDate,
     from: decodeMimeHeader(headers.get("from") || ""),
     date: headers.get("date") || "",
     subject: decodeMimeHeader(headers.get("subject") || "(无主题)"),
     body: extractReadableBody(rawMessage).slice(0, 20000),
+    htmlBody: extractHtmlBody(rawMessage).slice(0, 200000),
     links: extractLinks(rawMessage),
   };
+  return {
+    ...message,
+    codes: extractVerificationCodes(message),
+  };
+}
+
+const CODE_KEYWORDS =
+  /验证码|校验码|动态码|确认码|安全码|verification|verify|code|otp|pin|passcode|one.?time|security|auth/i;
+const LINK_CODE_KEYWORDS =
+  /verify|confirm|activate|magic|login|auth|token|code|reset|validate|验证|确认|激活|登录/i;
+const YEAR_CODE_RE = /^(20[2-4]\d)$/;
+const PHONE_CONTEXT_RE = /phone|mobile|tel|电话|手机|传真|fax/i;
+const MONEY_CONTEXT_RE = /\$|¥|€|£|金额|价格|付款|支付|total|amount|price|fee/i;
+
+function extractVerificationCodes(message) {
+  const text = normalizeMailText(
+    `${message.subject || ""}\n${message.body || ""}\n${message.htmlBody ? htmlToText(message.htmlBody) : ""}`,
+  );
+  const codes = [
+    ...extractNumericCodes(text),
+    ...extractAlphanumericCodes(text),
+    ...extractCodeLinks(message.links || []),
+  ];
+  codes.sort((left, right) => right.confidence - left.confidence);
+  const seen = new Set();
+  return codes
+    .filter((code) => {
+      const key = `${code.type}:${code.value}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 8);
+}
+
+function extractNumericCodes(text) {
+  const results = [];
+  for (const match of String(text || "").matchAll(/\b(\d{4,8})\b/g)) {
+    const value = match[1];
+    const context = codeContext(text, match.index);
+    if (YEAR_CODE_RE.test(value)) continue;
+    if (PHONE_CONTEXT_RE.test(context)) continue;
+    if (MONEY_CONTEXT_RE.test(context)) continue;
+    if (/^\d{5}$/.test(value) && /zip|postal|邮编/i.test(context)) continue;
+    let confidence = 0.35;
+    if (CODE_KEYWORDS.test(context)) confidence = 0.9;
+    if (value.length === 6) confidence += 0.05;
+    if (/[:：]\s*\d/.test(context)) confidence += 0.05;
+    results.push({ type: "numeric", value, confidence: Math.min(confidence, 1), context });
+  }
+  return results;
+}
+
+function extractAlphanumericCodes(text) {
+  const results = [];
+  for (const match of String(text || "").matchAll(/\b([A-Za-z0-9]{4,12})\b/g)) {
+    const value = match[1];
+    if (/^\d+$/.test(value) || /^[A-Za-z]+$/.test(value)) continue;
+    const context = codeContext(text, match.index);
+    if (!CODE_KEYWORDS.test(context)) continue;
+    results.push({ type: "alphanumeric", value, confidence: 0.72, context });
+  }
+  return results;
+}
+
+function extractCodeLinks(links) {
+  return (links || [])
+    .filter((link) => {
+      const text = `${link.href || ""} ${link.label || ""}`;
+      return LINK_CODE_KEYWORDS.test(text) && !/unsubscribe|退订/i.test(text);
+    })
+    .map((link) => {
+      const text = `${link.href || ""} ${link.label || ""}`;
+      return {
+        type: "link",
+        value: link.href,
+        confidence: /verify|confirm|activate|验证|确认|激活/i.test(text) ? 0.86 : 0.68,
+        context: (link.label && link.label !== link.href ? link.label : link.href || "").slice(0, 140),
+      };
+    });
+}
+
+function codeContext(text, index, radius = 44) {
+  const value = String(text || "");
+  return value.slice(Math.max(0, index - radius), Math.min(value.length, index + radius)).trim();
 }
 
 class ImapClient {
@@ -864,7 +1200,7 @@ class ImapClient {
         break;
       }
     }
-    throw normalizeImapConnectError(lastError);
+    throw normalizeImapConnectError(lastError, this.host);
   }
 
   connectOnce(attempt) {
@@ -1229,21 +1565,35 @@ function prioritizeFolders(folders) {
 }
 
 async function withAuthenticatedClient(clientId, refreshToken, email, callback) {
-  const client = new ImapClient(IMAP_HOST, IMAP_PORT);
+  let activeClient = null;
   return withTimeout(
     (async () => {
-      try {
-        const token = await refreshCredentialAccessToken(email);
-        await client.connect();
-        await client.authenticate(email, token.accessToken);
-        return await callback(client);
-      } finally {
-        await client.logout();
+      const token = await refreshCredentialAccessToken(email);
+      const authUsers = microsoftAuthUsers(email, token.accessToken);
+      const errors = [];
+      for (const host of IMAP_HOSTS) {
+        for (const authUser of authUsers) {
+          const client = new ImapClient(host, IMAP_PORT);
+          activeClient = client;
+          try {
+            await client.connect();
+            await client.authenticate(authUser, token.accessToken);
+            return await callback(client);
+          } catch (error) {
+            const suffix = authUser === email.toLowerCase() ? "" : ` as ${authUser}`;
+            errors.push(`${host}${suffix}: ${error.message}`);
+            if (IMAP_HOSTS.length === 1 && authUsers.length === 1) throw error;
+          } finally {
+            await client.logout();
+            if (activeClient === client) activeClient = null;
+          }
+        }
       }
+      throw new Error(`所有 Microsoft IMAP 入口均登录失败：${errors.join("；")}`);
     })(),
     FETCH_TIMEOUT_MS,
     `读取邮箱总超时（${FETCH_TIMEOUT_MS / 1000} 秒）。`,
-    () => client.destroy(),
+    () => activeClient?.destroy(),
   );
 }
 
@@ -1276,6 +1626,64 @@ async function refreshAndFetch(_clientId, _refreshToken, email, folder = "INBOX"
   });
 }
 
+async function waitForVerificationCode(clientId, refreshToken, email, options = {}) {
+  const folder = options.folder || "INBOX";
+  const timeoutMs = Math.min(Math.max(Number(options.timeoutMs || 60_000), 1_000), 120_000);
+  const intervalMs = Math.min(Math.max(Number(options.intervalMs || 3_000), 1_000), 10_000);
+  const type = ["numeric", "alphanumeric", "link"].includes(options.type) ? options.type : "";
+  const sinceTime = parseSinceTime(options.since);
+  const startedAt = Date.now();
+  let lastSnapshot = { unreadCount: null, messages: [] };
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    lastSnapshot = await refreshAndFetch(clientId, refreshToken, email, folder);
+    const match = findVerificationCode(lastSnapshot.messages, { type, sinceTime });
+    if (match) {
+      return {
+        found: true,
+        code: match.code,
+        message: match.message,
+        unreadCount: lastSnapshot.unreadCount,
+        waitedMs: Date.now() - startedAt,
+      };
+    }
+    const remaining = timeoutMs - (Date.now() - startedAt);
+    if (remaining <= 0) break;
+    await delay(Math.min(intervalMs, remaining));
+  }
+
+  return {
+    found: false,
+    code: null,
+    message: null,
+    unreadCount: lastSnapshot.unreadCount,
+    waitedMs: Date.now() - startedAt,
+    messages: lastSnapshot.messages,
+  };
+}
+
+function findVerificationCode(messages, options = {}) {
+  for (const message of messages || []) {
+    if (options.sinceTime && messageTime(message) <= options.sinceTime) continue;
+    const codes = (message.codes || []).filter((code) => !options.type || code.type === options.type);
+    if (codes.length) return { code: codes[0], message };
+  }
+  return null;
+}
+
+function messageTime(message) {
+  const parsed = Date.parse(message.receivedAt || message.date || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function parseSinceTime(value) {
+  if (!value) return 0;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 async function markMessagesRead(_clientId, _refreshToken, email, folder = "INBOX", uids = []) {
   return withAuthenticatedClient(_clientId, _refreshToken, email, async (client) => {
     await client.selectMailbox(folder);
@@ -1302,6 +1710,7 @@ const tokenKeepaliveState = {
   lastFinishedAt: null,
   lastSummary: null,
   lastErrors: [],
+  accountResults: [],
 };
 
 async function refreshStoredTokens(reason = "scheduled") {
@@ -1324,25 +1733,48 @@ async function refreshStoredTokens(reason = "scheduled") {
     failed: 0,
   };
   const errors = [];
+  const accountResults = [];
 
   try {
     for (const credential of credentials) {
+      const checkedAt = nowIso();
       try {
         const token = await refreshCredentialAccessToken(credential.email);
         summary.refreshed += 1;
         if (token.rotated) summary.rotated += 1;
+        accountResults.push({
+          email: credential.email,
+          ok: true,
+          rotated: Boolean(token.rotated),
+          checkedAt,
+          error: "",
+          inactive: false,
+          failure: null,
+        });
       } catch (error) {
+        const failure = serializeFailure(error);
         summary.failed += 1;
         errors.push({
           email: credential.email,
           error: error.message,
         });
+        accountResults.push({
+          email: credential.email,
+          ok: false,
+          rotated: false,
+          checkedAt,
+          error: error.message,
+          inactive: failure.terminal,
+          failure,
+        });
       }
       await delay(250);
     }
 
+    summary.accountResults = accountResults;
     tokenKeepaliveState.lastSummary = summary;
     tokenKeepaliveState.lastErrors = errors.slice(-20);
+    tokenKeepaliveState.accountResults = accountResults;
     console.log(
       `Token keepalive ${reason}: ${summary.refreshed}/${summary.total} refreshed, ${summary.rotated} rotated, ${summary.failed} failed`,
     );
@@ -1384,9 +1816,306 @@ function stopTokenKeepalive() {
   tokenKeepaliveTimers = [];
 }
 
+function tokenResultsByEmail() {
+  return new Map(
+    (tokenKeepaliveState.accountResults || []).map((result) => [
+      result.email.trim().toLowerCase(),
+      result,
+    ]),
+  );
+}
+
+function listAccountsForApi() {
+  const results = tokenResultsByEmail();
+  return listAccounts().map((account) => ({
+    ...account,
+    tokenKeepalive: results.get(account.email.trim().toLowerCase()) || null,
+  }));
+}
+
+function tokenKeepalivePayload() {
+  return {
+    running: tokenKeepaliveState.running,
+    lastStartedAt: tokenKeepaliveState.lastStartedAt,
+    lastFinishedAt: tokenKeepaliveState.lastFinishedAt,
+    lastSummary: tokenKeepaliveState.lastSummary,
+    lastErrors: tokenKeepaliveState.lastErrors,
+    accountResults: tokenKeepaliveState.accountResults,
+  };
+}
+
+function openApiDocument(baseUrl = "http://127.0.0.1:1111") {
+  return {
+    openapi: "3.1.0",
+    info: {
+      title: "邮箱聚合平台本地调用 API",
+      version: APP_VERSION,
+    },
+    servers: [{ url: baseUrl }],
+    paths: {
+      "/api/v1/health": { get: { summary: "服务状态" } },
+      "/api/v1/accounts": { get: { summary: "账号列表和最近 token 保活结果" } },
+      "/api/v1/accounts/batch-delete": {
+        post: {
+          summary: "批量删除账号",
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { ids: { type: "array", items: { type: "string" } } },
+                  required: ["ids"],
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/v1/accounts/{id}/folders": { get: { summary: "读取邮箱文件夹" } },
+      "/api/v1/accounts/{id}/messages": {
+        post: {
+          summary: "读取指定邮箱最近邮件摘要",
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { folder: { type: "string", default: "INBOX" } },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/v1/accounts/{id}/code": {
+        post: {
+          summary: "提取或等待验证码",
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    folder: { type: "string", default: "INBOX" },
+                    wait: { type: "boolean", default: true },
+                    timeoutMs: { type: "integer", default: 60000, maximum: 120000 },
+                    type: { type: "string", enum: ["numeric", "alphanumeric", "link"] },
+                    since: { type: "string", description: "ISO 时间或 epoch milliseconds，用于跳过旧邮件" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/v1/accounts/{id}/mark-read": {
+        post: {
+          summary: "按 UID 标记邮件为已读",
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    folder: { type: "string", default: "INBOX" },
+                    uids: { type: "array", items: { type: "integer" } },
+                  },
+                  required: ["uids"],
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/v1/token-keepalive/status": { get: { summary: "token 保活状态" } },
+      "/api/v1/token-keepalive/run": { post: { summary: "立即运行 token 保活" } },
+      "/api/v1/import": {
+        post: {
+          summary: "导入 Outlook / Hotmail OAuth2 凭证",
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { credentials: { type: "string" } },
+                  required: ["credentials"],
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/v1/openapi.json": { get: { summary: "OpenAPI 描述" } },
+    },
+  };
+}
+
+async function routeApiV1(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/api/v1/openapi.json") {
+    jsonResponse(res, 200, openApiDocument(url.origin));
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/v1/health") {
+    jsonResponse(res, 200, {
+      ok: true,
+      version: APP_VERSION,
+      dbFile: DB_FILE,
+      accountCount: listAccounts().length,
+      imapHosts: IMAP_HOSTS,
+      tokenKeepalive: tokenKeepalivePayload(),
+    });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/v1/accounts") {
+    jsonResponse(res, 200, { accounts: listAccountsForApi() });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/v1/accounts/batch-delete") {
+    const body = await getBody(req);
+    const result = deleteAccounts(body.ids);
+    jsonResponse(res, 200, { ok: true, deleted: result.deleted, accounts: listAccountsForApi() });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/v1/token-keepalive/status") {
+    jsonResponse(res, 200, tokenKeepalivePayload());
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/v1/token-keepalive/run") {
+    const summary = await refreshStoredTokens("api-v1");
+    jsonResponse(res, 200, {
+      summary,
+      accountResults: summary.accountResults || tokenKeepaliveState.accountResults,
+      running: tokenKeepaliveState.running,
+      lastFinishedAt: tokenKeepaliveState.lastFinishedAt,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/v1/import") {
+    const body = await getBody(req);
+    const parsed = parseCredentialText(body.credentials || body.csv);
+    const imported = importRows(parsed.rows);
+    jsonResponse(res, 200, {
+      imported,
+      errors: parsed.errors,
+      accounts: listAccountsForApi(),
+    });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname.match(/^\/api\/v1\/accounts\/[^/]+\/folders$/)) {
+    const id = url.pathname.split("/")[4];
+    const credential = findCredential(id);
+    const folders = await listFolders(credential.clientId, credential.refreshToken, credential.email);
+    jsonResponse(res, 200, { folders });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname.match(/^\/api\/v1\/accounts\/[^/]+\/messages$/)) {
+    const id = url.pathname.split("/")[4];
+    const body = await getBody(req);
+    const credential = findCredential(id);
+    const folder = body.folder || "INBOX";
+    const snapshot = await refreshAndFetch(
+      credential.clientId,
+      credential.refreshToken,
+      credential.email,
+      folder,
+    );
+    jsonResponse(res, 200, {
+      account: {
+        id: accountId(credential.email),
+        email: credential.email,
+        clientId: credential.clientId,
+        folder,
+        fetchedAt: nowIso(),
+        unreadCount: snapshot.unreadCount,
+      },
+      unreadCount: snapshot.unreadCount,
+      messages: snapshot.messages,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname.match(/^\/api\/v1\/accounts\/[^/]+\/code$/)) {
+    const id = url.pathname.split("/")[4];
+    const body = await getBody(req);
+    const credential = findCredential(id);
+    const wait = body.wait !== false;
+    const options = {
+      folder: body.folder || "INBOX",
+      timeoutMs: wait ? body.timeoutMs : 1_000,
+      intervalMs: body.intervalMs,
+      type: body.type,
+      since: body.since,
+    };
+    const result = await waitForVerificationCode(
+      credential.clientId,
+      credential.refreshToken,
+      credential.email,
+      options,
+    );
+    jsonResponse(res, 200, {
+      account: {
+        id: accountId(credential.email),
+        email: credential.email,
+        folder: options.folder,
+        fetchedAt: nowIso(),
+      },
+      ...result,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname.match(/^\/api\/v1\/accounts\/[^/]+\/mark-read$/)) {
+    const id = url.pathname.split("/")[4];
+    const body = await getBody(req);
+    const credential = findCredential(id);
+    const folder = body.folder || "INBOX";
+    const result = await markMessagesRead(
+      credential.clientId,
+      credential.refreshToken,
+      credential.email,
+      folder,
+      body.uids || [],
+    );
+    jsonResponse(res, 200, {
+      account: {
+        id: accountId(credential.email),
+        email: credential.email,
+        folder,
+        fetchedAt: nowIso(),
+        unreadCount: result.unreadCount,
+      },
+      markedCount: result.markedCount,
+      unreadCount: result.unreadCount,
+    });
+    return;
+  }
+
+  jsonResponse(res, 404, { error: "接口不存在。" });
+}
+
 async function routeApi(req, res, url) {
+  if (url.pathname.startsWith("/api/v1/")) {
+    await routeApiV1(req, res, url);
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/accounts") {
     jsonResponse(res, 200, { accounts: listAccounts() });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/accounts/batch-delete") {
+    const body = await getBody(req);
+    const result = deleteAccounts(body.ids);
+    jsonResponse(res, 200, { ok: true, ...result });
     return;
   }
 
@@ -1445,6 +2174,19 @@ async function routeApi(req, res, url) {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/open-link") {
+    const body = await getBody(req);
+    const result = await openNormalWindow(body.url);
+    jsonResponse(res, 200, { ok: true, command: result.command });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/restart") {
+    const restarting = restartDesktopApp();
+    jsonResponse(res, 200, { ok: true, restarting });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname.match(/^\/api\/accounts\/[^/]+\/fetch$/)) {
     const id = url.pathname.split("/")[3];
     const body = await getBody(req);
@@ -1466,6 +2208,36 @@ async function routeApi(req, res, url) {
       },
       unreadCount: snapshot.unreadCount,
       messages: snapshot.messages,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname.match(/^\/api\/accounts\/[^/]+\/code$/)) {
+    const id = url.pathname.split("/")[3];
+    const body = await getBody(req);
+    const credential = findCredential(id);
+    const wait = body.wait !== false;
+    const options = {
+      folder: body.folder || "INBOX",
+      timeoutMs: wait ? body.timeoutMs : 1_000,
+      intervalMs: body.intervalMs,
+      type: body.type,
+      since: body.since,
+    };
+    const result = await waitForVerificationCode(
+      credential.clientId,
+      credential.refreshToken,
+      credential.email,
+      options,
+    );
+    jsonResponse(res, 200, {
+      account: {
+        id: accountId(credential.email),
+        email: credential.email,
+        folder: options.folder,
+        fetchedAt: nowIso(),
+      },
+      ...result,
     });
     return;
   }
@@ -1538,13 +2310,22 @@ function createRequestHandler(port) {
     try {
       const url = new URL(req.url || "/", `http://${req.headers.host || `localhost:${port}`}`);
       if (url.pathname.startsWith("/api/")) {
+        applyCors(req, res);
+        if (req.method === "OPTIONS") {
+          res.writeHead(204, { "cache-control": "no-store" });
+          res.end();
+          return;
+        }
         await routeApi(req, res, url);
         return;
       }
       await serveStatic(req, res, url);
     } catch (error) {
       console.error(error.stack || error.message || error);
-      jsonResponse(res, 500, { error: error.message || "服务器内部错误。" });
+      jsonResponse(res, apiErrorStatus(error), {
+        error: error.message || "服务器内部错误。",
+        failure: serializeFailure(error),
+      });
     }
   };
 }

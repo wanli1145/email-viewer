@@ -1,6 +1,6 @@
 {
   "name": "local-outlook-mailbox-tool",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "本地 Outlook OAuth2 IMAP 邮箱聚合桌面工具",
   "author": "Local",
   "private": true,
@@ -12,6 +12,7 @@
     "app:dist": "electron-builder -m",
     "start": "node server.js",
     "runoutlook": "./runoutlook",
+    "test": "node --test",
     "check": "node --check server.js && node --check public/app.js && node --check desktop/main.js"
   },
   "build": {
@@ -26,6 +27,7 @@
       ]
     },
     "files": [
+      "build/icon.png",
       "desktop/**/*",
       "public/**/*",
       "server.js",

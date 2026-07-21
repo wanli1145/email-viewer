@@ -8,6 +8,8 @@ const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 let serverHandle = null;
 let mainWindow = null;
 
+app.commandLine.appendSwitch("use-mock-keychain");
+
 async function exists(path) {
   try {
     await access(path);
@@ -55,6 +57,7 @@ async function createMainWindow() {
     minWidth: 980,
     minHeight: 680,
     title: "邮箱聚合平台",
+    icon: join(projectRoot, "build", "icon.png"),
     backgroundColor: "#edf3fb",
     show: false,
     webPreferences: {
